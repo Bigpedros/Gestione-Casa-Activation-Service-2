@@ -1,12 +1,17 @@
-import type {
-  ActivationRequest,
-  ActivationResponse,
-  LicenseValidationRequest,
-  LicenseValidationResponse,
-  LicenseDeactivationRequest,
-  LicenseDeactivationResponse,
-  SignedLicenseDocument,
+import crypto from 'node:crypto';
+import {
+  computeLicensePayloadHashV2,
+  type ActivationRequest,
+  type ActivationResponse,
+  type LicenseValidationRequest,
+  type LicenseValidationResponse,
+  type LicenseDeactivationRequest,
+  type LicenseDeactivationResponse,
+  type SignedLicenseDocument,
+  type SignedValidationReceiptV1,
+  type ValidationReceiptV1,
 } from '@gestione-casa/shared-sdk/activation';
+import type { LicenseDocumentV2 } from '@gestione-casa/shared-sdk/licensing';
 import type { LicenseRepository, LicenseRecord } from '../repositories/interfaces/LicenseRepository.js';
 import type { ActivationRepository, ActivationRecord } from '../repositories/interfaces/ActivationRepository.js';
 import type { ActivationPolicyRepository, ActivationPolicyRecord } from '../repositories/interfaces/ActivationPolicyRepository.js';
@@ -560,6 +565,7 @@ export class ActivationService {
 
       if (existingActive) {
         const signedLicense = this.createSignedDocument(license, deviceId);
+        const receipt = this.createSignedValidationReceipt(license, deviceId, serverTime);
         await auditRepo.append({
           eventType: 'ACTIVATION_IDEMPOTENT',
           licenseCodeMasked: maskedCode,
@@ -574,6 +580,7 @@ export class ActivationService {
           status: 'ALREADY_ACTIVE',
           activationId: existingActive.id,
           signedLicense,
+          ...(receipt ? { receipt } : {}),
           message: 'License is already active for this device',
           serverTime,
           requestId,
@@ -622,6 +629,7 @@ export class ActivationService {
           await activationRepo.reactivate(existingRecord.id, new Date().toISOString());
         }
         const signedLicense = this.createSignedDocument(license, deviceId);
+        const receipt = this.createSignedValidationReceipt(license, deviceId, serverTime);
 
         await auditRepo.append({
           eventType: 'REACTIVATION_SUCCESS',
@@ -638,6 +646,7 @@ export class ActivationService {
           status: 'ACTIVATED',
           activationId: existingRecord.id,
           signedLicense,
+          ...(receipt ? { receipt } : {}),
           message: 'License reactivated successfully',
           serverTime,
           requestId,
@@ -653,6 +662,7 @@ export class ActivationService {
       });
 
       const signedLicense = this.createSignedDocument(license, deviceId);
+      const receipt = this.createSignedValidationReceipt(license, deviceId, serverTime);
 
       await auditRepo.append({
         eventType: 'ACTIVATION_SUCCESS',
@@ -669,6 +679,7 @@ export class ActivationService {
         status: 'ACTIVATED',
         activationId: newActivation.id,
         signedLicense,
+        ...(receipt ? { receipt } : {}),
         message: 'License activated successfully',
         serverTime,
         requestId,
@@ -792,6 +803,7 @@ export class ActivationService {
       // 5. Successful validation -> touch lastValidatedAt
       await activationRepo.touchLastValidated(activeActivation.id, serverTime);
       const signedLicense = this.createSignedDocument(license, deviceId);
+      const receipt = this.createSignedValidationReceipt(license, deviceId, serverTime);
 
       await auditRepo.append({
         eventType: 'VALIDATION_SUCCESS',
@@ -807,6 +819,7 @@ export class ActivationService {
       return {
         status: 'VALID',
         signedLicense,
+        ...(receipt ? { receipt } : {}),
         lastValidatedAt: serverTime,
         serverTime,
         requestId,
@@ -941,5 +954,62 @@ export class ActivationService {
       licenseType: license.licenseType,
     };
     return LicenseSigningService.signLicense(document, privateKey, keyId);
+  }
+
+  private createSignedValidationReceipt(
+    license: LicenseRecord,
+    deviceId: string,
+    validatedAt: string
+  ): SignedValidationReceiptV1 | null {
+    if (license.schemaVersion !== 2) {
+      return null;
+    }
+
+    const { privateKey, keyId } = this.getSigningKeyInfo();
+
+    const offlinePolicy = {
+      allowed: license.allowOfflineValidation ?? true,
+      maxDays: (license.allowOfflineValidation === false) ? 0 : (license.maxOfflineDays ?? 30),
+    };
+
+    const licenseDocV2: LicenseDocumentV2 = {
+      id: license.id,
+      licenseCode: license.licenseCode,
+      checksum: license.checksum || 'default_checksum',
+      edition: license.edition || 'standard',
+      term: license.termType || 'perpetual',
+      status: (license.status || 'assigned') as any,
+      owner: (license.metadata?.owner as string) || (license.customerId || 'default_customer'),
+      customerId: license.customerId || null,
+      deviceId,
+      generatedAt: license.generatedAt || new Date().toISOString(),
+      assignedAt: null,
+      sentAt: null,
+      activatedAt: null,
+      suspendedAt: null,
+      revokedAt: null,
+      expiresAt: license.expiresAt || null,
+      engineVersion: (license.engineVersion as any) || '2.1',
+      schemaVersion: 2,
+      offlinePolicy,
+      metadata: license.metadata || {},
+    };
+
+    const licensePayloadHash = computeLicensePayloadHashV2(licenseDocV2);
+
+    const randomSuffix = crypto.randomUUID ? crypto.randomUUID().replace(/-/g, '').substring(0, 12) : Math.random().toString(36).substring(2, 14);
+    const receipt: ValidationReceiptV1 = {
+      receiptVersion: 1,
+      receiptId: `rcpt_${Date.now()}_${randomSuffix}`,
+      licenseId: license.id,
+      deviceId,
+      licenseSchemaVersion: 2,
+      validatedAt,
+      offlineValidUntil: null,
+      licenseExpiresAt: license.expiresAt || null,
+      licensePayloadHash,
+    };
+
+    return LicenseSigningService.signValidationReceipt(receipt, privateKey, keyId);
   }
 }
