@@ -295,6 +295,7 @@ export class ActivationService {
         this.executeValidation(
           this.licenseRepo!,
           this.activationRepo!,
+          this.policyRepo,
           this.auditRepo!,
           licenseCode,
           deviceId,
@@ -311,11 +312,13 @@ export class ActivationService {
         return await withTransaction(async (client) => {
           const txLicenseRepo = new PostgresLicenseRepository(client);
           const txActivationRepo = new PostgresActivationRepository(client);
+          const txPolicyRepo = new PostgresActivationPolicyRepository(client);
           const txAuditRepo = new PostgresAuditRepository(client);
 
           return this.executeValidation(
             txLicenseRepo,
             txActivationRepo,
+            txPolicyRepo,
             txAuditRepo,
             licenseCode,
             deviceId,
@@ -345,6 +348,7 @@ export class ActivationService {
       this.executeValidation(
         this.memoryFallbackStore.licenseRepo,
         this.memoryFallbackStore.activationRepo,
+        this.memoryFallbackStore.policyRepo,
         this.memoryFallbackStore.auditRepo,
         licenseCode,
         deviceId,
@@ -565,7 +569,7 @@ export class ActivationService {
 
       if (existingActive) {
         const signedLicense = this.createSignedDocument(license, deviceId);
-        const receipt = this.createSignedValidationReceipt(license, deviceId, serverTime);
+        const receipt = this.createSignedValidationReceipt(license, deviceId, serverTime, policy);
         await auditRepo.append({
           eventType: 'ACTIVATION_IDEMPOTENT',
           licenseCodeMasked: maskedCode,
@@ -629,7 +633,7 @@ export class ActivationService {
           await activationRepo.reactivate(existingRecord.id, new Date().toISOString());
         }
         const signedLicense = this.createSignedDocument(license, deviceId);
-        const receipt = this.createSignedValidationReceipt(license, deviceId, serverTime);
+        const receipt = this.createSignedValidationReceipt(license, deviceId, serverTime, policy);
 
         await auditRepo.append({
           eventType: 'REACTIVATION_SUCCESS',
@@ -662,7 +666,7 @@ export class ActivationService {
       });
 
       const signedLicense = this.createSignedDocument(license, deviceId);
-      const receipt = this.createSignedValidationReceipt(license, deviceId, serverTime);
+      const receipt = this.createSignedValidationReceipt(license, deviceId, serverTime, policy);
 
       await auditRepo.append({
         eventType: 'ACTIVATION_SUCCESS',
@@ -701,6 +705,7 @@ export class ActivationService {
   private async executeValidation(
     licenseRepo: LicenseRepository,
     activationRepo: ActivationRepository,
+    policyRepo: ActivationPolicyRepository | undefined,
     auditRepo: AuditRepository,
     licenseCode: string,
     deviceId: string,
@@ -800,10 +805,21 @@ export class ActivationService {
         };
       }
 
+      // Check activation policy for offline calculation (if present)
+      let policy: ActivationPolicyRecord | null = null;
+      if (policyRepo) {
+        if (typeof policyRepo.findByLicenseId === 'function') {
+          policy = await policyRepo.findByLicenseId(license.id, { forUpdate });
+        }
+        if (!policy && typeof policyRepo.findByLicenseType === 'function') {
+          policy = await policyRepo.findByLicenseType(license.licenseType, { forUpdate });
+        }
+      }
+
       // 5. Successful validation -> touch lastValidatedAt
       await activationRepo.touchLastValidated(activeActivation.id, serverTime);
       const signedLicense = this.createSignedDocument(license, deviceId);
-      const receipt = this.createSignedValidationReceipt(license, deviceId, serverTime);
+      const receipt = this.createSignedValidationReceipt(license, deviceId, serverTime, policy);
 
       await auditRepo.append({
         eventType: 'VALIDATION_SUCCESS',
@@ -959,7 +975,8 @@ export class ActivationService {
   private createSignedValidationReceipt(
     license: LicenseRecord,
     deviceId: string,
-    validatedAt: string
+    validatedAt: string,
+    serverPolicy: ActivationPolicyRecord | null = null
   ): SignedValidationReceiptV1 | null {
     if (license.schemaVersion !== 2) {
       return null;
@@ -967,9 +984,14 @@ export class ActivationService {
 
     const { privateKey, keyId } = this.getSigningKeyInfo();
 
+    const licenseAllowed = license.allowOfflineValidation === true;
+    const licenseMaxDays = (typeof license.maxOfflineDays === 'number' && Number.isSafeInteger(license.maxOfflineDays) && license.maxOfflineDays > 0)
+      ? license.maxOfflineDays
+      : 0;
+
     const offlinePolicy = {
-      allowed: license.allowOfflineValidation ?? true,
-      maxDays: (license.allowOfflineValidation === false) ? 0 : (license.maxOfflineDays ?? 30),
+      allowed: licenseAllowed,
+      maxDays: licenseAllowed ? (licenseMaxDays > 0 ? licenseMaxDays : 30) : 0,
     };
 
     const licenseDocV2: LicenseDocumentV2 = {
@@ -997,6 +1019,32 @@ export class ActivationService {
 
     const licensePayloadHash = computeLicensePayloadHashV2(licenseDocV2);
 
+    // AS-4: Effective offline calculation
+    let offlineValidUntil: string | null = null;
+    const serverPolicyExists = serverPolicy !== null && serverPolicy !== undefined;
+    const serverAllowed = serverPolicyExists && serverPolicy.allowOfflineValidation === true;
+    const effectiveAllowed = licenseAllowed === true && serverPolicyExists && serverAllowed === true;
+
+    if (effectiveAllowed) {
+      const isPositiveInteger = (val: unknown): val is number =>
+        typeof val === 'number' && Number.isSafeInteger(val) && val > 0;
+
+      if (isPositiveInteger(license.maxOfflineDays) && isPositiveInteger(serverPolicy.maxOfflineDays)) {
+        const effectiveMaxOfflineDays = Math.min(license.maxOfflineDays, serverPolicy.maxOfflineDays);
+        if (effectiveMaxOfflineDays > 0) {
+          const validatedAtMs = new Date(validatedAt).getTime();
+          const candidateMs = validatedAtMs + effectiveMaxOfflineDays * 86400000;
+
+          if (!license.expiresAt) {
+            offlineValidUntil = new Date(candidateMs).toISOString();
+          } else {
+            const expiresAtMs = new Date(license.expiresAt).getTime();
+            offlineValidUntil = new Date(Math.min(candidateMs, expiresAtMs)).toISOString();
+          }
+        }
+      }
+    }
+
     const randomSuffix = crypto.randomUUID ? crypto.randomUUID().replace(/-/g, '').substring(0, 12) : Math.random().toString(36).substring(2, 14);
     const receipt: ValidationReceiptV1 = {
       receiptVersion: 1,
@@ -1005,7 +1053,7 @@ export class ActivationService {
       deviceId,
       licenseSchemaVersion: 2,
       validatedAt,
-      offlineValidUntil: null,
+      offlineValidUntil,
       licenseExpiresAt: license.expiresAt || null,
       licensePayloadHash,
     };

@@ -356,9 +356,9 @@ test('AS-3: 9. validatedAt ISO valido', async () => {
   assert.ok(!isNaN(Date.parse(validatedAt)), 'validatedAt must be a valid ISO 8601 string');
 });
 
-// 10. offlineValidUntil === null
-test('AS-3: 10. offlineValidUntil === null sempre in AS-3', async () => {
-  const lic = createV2LicenseRecord({ allowOfflineValidation: true, maxOfflineDays: 60 });
+// 10. offlineValidUntil === null quando offline non consentito
+test('AS-3: 10. offlineValidUntil === null quando offlinePolicy.allowed è false', async () => {
+  const lic = createV2LicenseRecord({ allowOfflineValidation: false, maxOfflineDays: 0 });
   const env = createTestEnvironment([lic]);
   const res = await env.service.activate(
     { licenseCode: lic.licenseCode, deviceId: 'dev_off_null', productId: 'gestione-casa' },
