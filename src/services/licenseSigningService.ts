@@ -3,7 +3,7 @@ import {
   buildCanonicalLicensePayloadV1,
   type SignedLicenseDocument,
 } from '@gestione-casa/shared-sdk/activation';
-import type { LicenseDocument } from '@gestione-casa/shared-sdk/licensing';
+import type { LicenseDocument, LicenseDocumentV1 } from '@gestione-casa/shared-sdk/licensing';
 
 export class LicenseSigningService {
   /**
@@ -44,7 +44,7 @@ export class LicenseSigningService {
     const signature = signatureBuffer.toString('hex');
 
     return {
-      license: document as LicenseDocument,
+      license: document as LicenseDocumentV1,
       signature,
       signatureAlgorithm: 'Ed25519',
       keyId,
