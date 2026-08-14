@@ -1,8 +1,6 @@
 node_modules/
 build/
 dist/
-!vendor/shared-sdk-0.4.0/dist/
-!vendor/shared-sdk-0.4.0/dist/**
 vendor/*.tgz
 coverage/
 .DS_Store
