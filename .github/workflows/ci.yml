@@ -25,10 +25,8 @@ jobs:
           node-version: 22
           cache: 'npm'
 
-      - name: Download and verify Gestione Casa Shared SDK 0.5.1
+      - name: Verify Gestione Casa Shared SDK 0.5.1
         run: |
-          mkdir -p vendor
-          curl -sL -o vendor/gestione-casa-shared-sdk-0.5.1.tgz https://github.com/Bigpedros/GC-shared-SDK/releases/download/v0.5.1/gestione-casa-shared-sdk-0.5.1.tgz
           echo "9e4fee87e6309ee1753aed31b7524dfb573b4786c55c75b5fd76c6423d2d0529  vendor/gestione-casa-shared-sdk-0.5.1.tgz" | sha256sum -c -
 
       - name: Install dependencies
